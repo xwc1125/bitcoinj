@@ -18,7 +18,6 @@ package org.bitcoinj.core;
 
 import org.bitcoinj.utils.MonetaryFormat;
 import com.google.common.math.LongMath;
-import com.google.common.primitives.Longs;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
@@ -116,13 +115,9 @@ public final class Coin implements Monetary, Comparable<Coin>, Serializable {
     }
 
     /**
-     * <p>
-     * Parses an amount expressed in the way humans are used to.
-     * <p/>
-     * <p>
-     * This takes string in a format understood by {@link BigDecimal#BigDecimal(String)}, for example "0", "1", "0.10",
-     * "1.23E3", "1234.5E-5".
-     * </p>
+     * <p>Parses an amount expressed in the way humans are used to.</p>
+     * <p>This takes string in a format understood by {@link BigDecimal#BigDecimal(String)}, for example "0", "1", "0.10",
+     * "1.23E3", "1234.5E-5".</p>
      *
      * @throws IllegalArgumentException
      *             if you try to specify fractional satoshis, or a value out of range.
@@ -137,13 +132,9 @@ public final class Coin implements Monetary, Comparable<Coin>, Serializable {
     }
 
     /**
-     * <p>
-     * Parses an amount expressed in the way humans are used to. The amount is cut to satoshi precision.
-     * <p/>
-     * <p>
-     * This takes string in a format understood by {@link BigDecimal#BigDecimal(String)}, for example "0", "1", "0.10",
-     * "1.23E3", "1234.5E-5".
-     * <p/>
+     * <p>Parses an amount expressed in the way humans are used to. The amount is cut to satoshi precision.</p>
+     * <p>This takes string in a format understood by {@link BigDecimal#BigDecimal(String)}, for example "0", "1", "0.10",
+     * "1.23E3", "1234.5E-5".</p>
      *
      * @throws IllegalArgumentException
      *             if you try to specify a value out of range.
@@ -320,6 +311,6 @@ public final class Coin implements Monetary, Comparable<Coin>, Serializable {
 
     @Override
     public int compareTo(final Coin other) {
-        return Longs.compare(this.value, other.value);
+        return Long.compare(this.value, other.value);
     }
 }

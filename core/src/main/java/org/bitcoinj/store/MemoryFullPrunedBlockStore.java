@@ -17,9 +17,7 @@
 package org.bitcoinj.store;
 
 import org.bitcoinj.core.*;
-import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 import javax.annotation.Nullable;
 import java.util.*;
@@ -61,7 +59,7 @@ class StoredTransactionOutPoint {
 
     @Override
     public int hashCode() {
-        return Objects.hashCode(getIndex(), getHash());
+        return Objects.hash(getIndex(), getHash());
     }
     
     @Override
@@ -74,7 +72,7 @@ class StoredTransactionOutPoint {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         StoredTransactionOutPoint other = (StoredTransactionOutPoint) o;
-        return getIndex() == other.getIndex() && Objects.equal(getHash(), other.getHash());
+        return getIndex() == other.getIndex() && Objects.equals(getHash(), other.getHash());
     }
 }
 
@@ -229,7 +227,7 @@ class TransactionalMultiKeyHashMap<UniqueKeyType, MultiKeyType, ValueType> {
 }
 
 /**
- * Keeps {@link StoredBlock}s, {@link StoredUndoableBlock}s and {@link org.bitcoinj.core.UTXO}s in memory.
+ * Keeps {@link StoredBlock}s, {@link StoredUndoableBlock}s and {@link UTXO}s in memory.
  * Used primarily for unit testing.
  */
 public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore {
@@ -261,7 +259,7 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore {
         try {
             StoredBlock storedGenesisHeader = new StoredBlock(params.getGenesisBlock().cloneAsHeader(), params.getGenesisBlock().getWork(), 0);
             // The coinbase in the genesis block is not spendable
-            List<Transaction> genesisTransactions = Lists.newLinkedList();
+            List<Transaction> genesisTransactions = new LinkedList<>();
             StoredUndoableBlock storedGenesis = new StoredUndoableBlock(params.getGenesisBlock().getHash(), genesisTransactions);
             put(storedGenesisHeader, storedGenesis);
             setChainHead(storedGenesisHeader);
@@ -412,13 +410,15 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore {
     }
 
     @Override
-    public List<UTXO> getOpenTransactionOutputs(List<Address> addresses) throws UTXOProviderException {
+    public List<UTXO> getOpenTransactionOutputs(List<ECKey> keys) throws UTXOProviderException {
         // This is *NOT* optimal: We go through all the outputs and select the ones we are looking for.
         // If someone uses this store for production then they have a lot more to worry about than an inefficient impl :)
         List<UTXO> foundOutputs = new ArrayList<>();
         List<UTXO> outputsList = transactionOutputMap.values();
         for (UTXO output : outputsList) {
-            for (Address address : addresses) {
+            for (ECKey key : keys) {
+                // TODO switch to pubKeyHash in order to support native segwit addresses
+                Address address = LegacyAddress.fromKey(params, key);
                 if (output.getAddress().equals(address.toString())) {
                     foundOutputs.add(output);
                 }

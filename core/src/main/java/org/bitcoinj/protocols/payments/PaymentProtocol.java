@@ -23,7 +23,6 @@ import org.bitcoinj.script.ScriptBuilder;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import org.bitcoin.protocols.payments.Protos;
@@ -54,7 +53,7 @@ public class PaymentProtocol {
 
     /**
      * Create a payment request with one standard pay to address output. You may want to sign the request using
-     * {@link #signPaymentRequest}. Use {@link org.bitcoin.protocols.payments.Protos.PaymentRequest.Builder#build} to get the actual payment
+     * {@link #signPaymentRequest}. Use {@link Protos.PaymentRequest.Builder#build} to get the actual payment
      * request.
      *
      * @param params network parameters
@@ -74,7 +73,7 @@ public class PaymentProtocol {
 
     /**
      * Create a payment request. You may want to sign the request using {@link #signPaymentRequest}. Use
-     * {@link org.bitcoin.protocols.payments.Protos.PaymentRequest.Builder#build} to get the actual payment request.
+     * {@link Protos.PaymentRequest.Builder#build} to get the actual payment request.
      * 
      * @param params network parameters
      * @param outputs list of outputs to request coins to
@@ -157,7 +156,7 @@ public class PaymentProtocol {
      * 
      * @param paymentRequest Payment request to verify.
      * @param trustStore KeyStore of trusted root certificate authorities.
-     * @return verification data, or null if no PKI method was specified in the {@link org.bitcoin.protocols.payments.Protos.PaymentRequest}.
+     * @return verification data, or null if no PKI method was specified in the {@link Protos.PaymentRequest}.
      * @throws PaymentProtocolException if payment request could not be verified.
      */
     @Nullable
@@ -186,7 +185,7 @@ public class PaymentProtocol {
             // The ordering of certificates is defined by the payment protocol spec to be the same as what the Java
             // crypto API requires - convenient!
             CertificateFactory certificateFactory = CertificateFactory.getInstance("X.509");
-            certs = Lists.newArrayList();
+            certs = new ArrayList<>();
             for (ByteString bytes : protoCerts.getCertificateList())
                 certs.add((X509Certificate) certificateFactory.generateCertificate(bytes.newInput()));
             CertPath path = certificateFactory.generateCertPath(certs);

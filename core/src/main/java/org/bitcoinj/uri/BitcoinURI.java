@@ -85,8 +85,8 @@ public class BitcoinURI {
     public static final String FIELD_PAYMENT_REQUEST_URL = "r";
 
     /**
-     * URI for Bitcoin network. Use {@link org.bitcoinj.params.AbstractBitcoinNetParams#BITCOIN_SCHEME} if you specifically
-     * need Bitcoin, or use {@link org.bitcoinj.core.NetworkParameters#getUriScheme} to get the scheme
+     * URI for Bitcoin network. Use {@link AbstractBitcoinNetParams#BITCOIN_SCHEME} if you specifically
+     * need Bitcoin, or use {@link NetworkParameters#getUriScheme} to get the scheme
      * from network parameters.
      */
     @Deprecated
@@ -146,9 +146,10 @@ public class BitcoinURI {
         String blockchainInfoScheme = scheme + "://";
         String correctScheme = scheme + ":";
         String schemeSpecificPart;
-        if (input.startsWith(blockchainInfoScheme)) {
+        final String inputLc = input.toLowerCase(Locale.US);
+        if (inputLc.startsWith(blockchainInfoScheme)) {
             schemeSpecificPart = input.substring(blockchainInfoScheme.length());
-        } else if (input.startsWith(correctScheme)) {
+        } else if (inputLc.startsWith(correctScheme)) {
             schemeSpecificPart = input.substring(correctScheme.length());
         } else {
             throw new BitcoinURIParseException("Unsupported URI scheme: " + uri.getScheme());
@@ -175,7 +176,7 @@ public class BitcoinURI {
         if (!addressToken.isEmpty()) {
             // Attempt to parse the addressToken as a Bitcoin address for this network
             try {
-                Address address = Address.fromBase58(params, addressToken);
+                Address address = Address.fromString(params, addressToken);
                 putWithValidation(FIELD_ADDRESS, address);
             } catch (final AddressFormatException e) {
                 throw new BitcoinURIParseException("Bad address", e);
@@ -255,7 +256,7 @@ public class BitcoinURI {
     }
 
     /**
-     * The Bitcoin Address from the URI, if one was present. It's possible to have Bitcoin URI's with no address if a
+     * The Bitcoin address from the URI, if one was present. It's possible to have Bitcoin URI's with no address if a
      * r= payment protocol parameter is specified, though this form is not recommended as older wallets can't understand
      * it.
      */

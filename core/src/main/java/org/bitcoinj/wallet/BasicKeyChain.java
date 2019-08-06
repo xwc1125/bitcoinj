@@ -1,5 +1,6 @@
 /*
  * Copyright 2013 Google Inc.
+ * Copyright 2019 Andreas Schildbach
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,15 +19,15 @@ package org.bitcoinj.wallet;
 
 import org.bitcoinj.core.BloomFilter;
 import org.bitcoinj.core.ECKey;
+import org.bitcoinj.core.NetworkParameters;
 import org.bitcoinj.crypto.*;
 import org.bitcoinj.utils.ListenerRegistration;
 import org.bitcoinj.utils.Threading;
 import org.bitcoinj.wallet.listeners.KeyChainEventListener;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
-import org.spongycastle.crypto.params.KeyParameter;
+import org.bouncycastle.crypto.params.KeyParameter;
 
 import javax.annotation.Nullable;
 import java.util.*;
@@ -44,7 +45,7 @@ import static com.google.common.base.Preconditions.*;
 public class BasicKeyChain implements EncryptableKeyChain {
     private final ReentrantLock lock = Threading.lock("BasicKeyChain");
 
-    // Maps used to let us quickly look up a key given data we find in transcations or the block chain.
+    // Maps used to let us quickly look up a key given data we find in transactions or the block chain.
     private final LinkedHashMap<ByteString, ECKey> hashToKeys;
     private final LinkedHashMap<ByteString, ECKey> pubkeyToKeys;
     @Nullable private final KeyCrypter keyCrypter;
@@ -203,19 +204,19 @@ public class BasicKeyChain implements EncryptableKeyChain {
         }
     }
 
-    public ECKey findKeyFromPubHash(byte[] pubkeyHash) {
+    public ECKey findKeyFromPubHash(byte[] pubKeyHash) {
         lock.lock();
         try {
-            return hashToKeys.get(ByteString.copyFrom(pubkeyHash));
+            return hashToKeys.get(ByteString.copyFrom(pubKeyHash));
         } finally {
             lock.unlock();
         }
     }
 
-    public ECKey findKeyFromPubKey(byte[] pubkey) {
+    public ECKey findKeyFromPubKey(byte[] pubKey) {
         lock.lock();
         try {
-            return pubkeyToKeys.get(ByteString.copyFrom(pubkey));
+            return pubkeyToKeys.get(ByteString.copyFrom(pubKey));
         } finally {
             lock.unlock();
         }
@@ -434,8 +435,8 @@ public class BasicKeyChain implements EncryptableKeyChain {
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     /**
-     * Convenience wrapper around {@link #toEncrypted(org.bitcoinj.crypto.KeyCrypter,
-     * org.spongycastle.crypto.params.KeyParameter)} which uses the default Scrypt key derivation algorithm and
+     * Convenience wrapper around {@link #toEncrypted(KeyCrypter,
+     * org.bouncycastle.crypto.params.KeyParameter)} which uses the default Scrypt key derivation algorithm and
      * parameters, derives a key from the given password and returns the created key.
      */
     @Override
@@ -449,7 +450,7 @@ public class BasicKeyChain implements EncryptableKeyChain {
 
     /**
      * Encrypt the wallet using the KeyCrypter and the AES key. A good default KeyCrypter to use is
-     * {@link org.bitcoinj.crypto.KeyCrypterScrypt}.
+     * {@link KeyCrypterScrypt}.
      *
      * @param keyCrypter The KeyCrypter that specifies how to encrypt/ decrypt a key
      * @param aesKey AES key to use (normally created using KeyCrypter#deriveKey and cached as it is time consuming
@@ -606,7 +607,7 @@ public class BasicKeyChain implements EncryptableKeyChain {
     public List<ECKey> findKeysBefore(long timeSecs) {
         lock.lock();
         try {
-            List<ECKey> results = Lists.newLinkedList();
+            List<ECKey> results = new LinkedList<>();
             for (ECKey key : hashToKeys.values()) {
                 final long keyTime = key.getCreationTimeSeconds();
                 if (keyTime < timeSecs) {
@@ -617,5 +618,14 @@ public class BasicKeyChain implements EncryptableKeyChain {
         } finally {
             lock.unlock();
         }
+    }
+
+    public String toString(boolean includePrivateKeys, @Nullable KeyParameter aesKey, NetworkParameters params) {
+        final StringBuilder builder = new StringBuilder();
+        List<ECKey> keys = getKeys();
+        Collections.sort(keys, ECKey.AGE_COMPARATOR);
+        for (ECKey key : keys)
+            key.formatKeyWithAddress(includePrivateKeys, aesKey, builder, params, null, "imported");
+        return builder.toString();
     }
 }

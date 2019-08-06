@@ -17,27 +17,27 @@
 
 package org.bitcoinj.tools;
 
-import org.bitcoinj.core.*;
 import org.bitcoinj.crypto.*;
-import org.bitcoinj.net.discovery.DnsDiscovery;
 import org.bitcoinj.params.MainNetParams;
 import org.bitcoinj.params.RegTestParams;
 import org.bitcoinj.params.TestNet3Params;
 import org.bitcoinj.protocols.payments.PaymentProtocol;
 import org.bitcoinj.protocols.payments.PaymentProtocolException;
 import org.bitcoinj.protocols.payments.PaymentSession;
-import org.bitcoinj.script.ScriptBuilder;
+import org.bitcoinj.script.Script;
+import org.bitcoinj.script.Script.ScriptType;
 import org.bitcoinj.script.ScriptException;
 import org.bitcoinj.store.*;
 import org.bitcoinj.uri.BitcoinURI;
 import org.bitcoinj.uri.BitcoinURIParseException;
 import org.bitcoinj.utils.BriefLogFormatter;
+import org.bitcoinj.wallet.DeterministicKeyChain;
 import org.bitcoinj.wallet.DeterministicSeed;
-import org.bitcoinj.wallet.DeterministicUpgradeRequiredException;
-import org.bitcoinj.wallet.DeterministicUpgradeRequiresPassword;
-import com.google.common.base.Charsets;
+
+import com.google.common.base.CharMatcher;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
+import com.google.common.io.BaseEncoding;
 import com.google.common.io.Resources;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -47,6 +47,30 @@ import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 import joptsimple.util.DateConverter;
 
+import org.bitcoinj.core.AbstractBlockChain;
+import org.bitcoinj.core.Address;
+import org.bitcoinj.core.AddressFormatException;
+import org.bitcoinj.core.Base58;
+import org.bitcoinj.core.Block;
+import org.bitcoinj.core.BlockChain;
+import org.bitcoinj.core.CheckpointManager;
+import org.bitcoinj.core.Coin;
+import org.bitcoinj.core.Context;
+import org.bitcoinj.core.DumpedPrivateKey;
+import org.bitcoinj.core.ECKey;
+import org.bitcoinj.core.FilteredBlock;
+import org.bitcoinj.core.FullPrunedBlockChain;
+import org.bitcoinj.core.InsufficientMoneyException;
+import org.bitcoinj.core.LegacyAddress;
+import org.bitcoinj.core.NetworkParameters;
+import org.bitcoinj.core.Peer;
+import org.bitcoinj.core.PeerAddress;
+import org.bitcoinj.core.PeerGroup;
+import org.bitcoinj.core.SegwitAddress;
+import org.bitcoinj.core.StoredBlock;
+import org.bitcoinj.core.Transaction;
+import org.bitcoinj.core.Utils;
+import org.bitcoinj.core.VerificationException;
 import org.bitcoinj.core.listeners.BlocksDownloadedEventListener;
 import org.bitcoinj.core.listeners.DownloadProgressTracker;
 import org.bitcoinj.wallet.MarriedKeyChain;
@@ -62,14 +86,14 @@ import org.bitcoinj.wallet.listeners.WalletCoinsSentEventListener;
 import org.bitcoinj.wallet.listeners.WalletReorganizeEventListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.spongycastle.crypto.params.KeyParameter;
-import org.spongycastle.util.encoders.Hex;
+import org.bouncycastle.crypto.params.KeyParameter;
 
 import javax.annotation.Nullable;
 import java.io.*;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -79,7 +103,6 @@ import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.LogManager;
 
@@ -91,24 +114,25 @@ import static com.google.common.base.Preconditions.checkNotNull;
  */
 public class WalletTool {
     private static final Logger log = LoggerFactory.getLogger(WalletTool.class);
+    private static final BaseEncoding HEX = BaseEncoding.base16().lowerCase();
 
     private static OptionSet options;
     private static OptionSpec<Date> dateFlag;
     private static OptionSpec<Long> unixtimeFlag;
     private static OptionSpec<String> seedFlag, watchFlag;
+    private static OptionSpec<Script.ScriptType> outputScriptTypeFlag;
     private static OptionSpec<String> xpubkeysFlag;
 
     private static NetworkParameters params;
     private static File walletFile;
     private static BlockStore store;
     private static AbstractBlockChain chain;
-    private static PeerGroup peers;
+    private static PeerGroup peerGroup;
     private static Wallet wallet;
     private static File chainFileName;
     private static ValidationMode mode;
     private static String password;
     private static org.bitcoin.protocols.payments.Protos.PaymentRequest paymentRequest;
-    private static OptionSpec<Integer> lookaheadSize;
 
     public static class Condition {
         public enum Type {
@@ -178,12 +202,10 @@ public class WalletTool {
         SYNC,
         RESET,
         SEND,
-        SEND_CLTVPAYMENTCHANNEL,
-        SETTLE_CLTVPAYMENTCHANNEL,
-        REFUND_CLTVPAYMENTCHANNEL,
         ENCRYPT,
         DECRYPT,
         MARRY,
+        UPGRADE,
         ROTATE,
         SET_CREATION_TIME,
     }
@@ -208,6 +230,8 @@ public class WalletTool {
         OptionSpec<String> walletFileName = parser.accepts("wallet").withRequiredArg().defaultsTo("wallet");
         seedFlag = parser.accepts("seed").withRequiredArg();
         watchFlag = parser.accepts("watchkey").withRequiredArg();
+        outputScriptTypeFlag = parser.accepts("output-script-type").withRequiredArg().ofType(Script.ScriptType.class)
+                .defaultsTo(Script.ScriptType.P2PKH);
         OptionSpec<NetworkEnum> netFlag = parser.accepts("net").withRequiredArg().ofType(NetworkEnum.class).defaultsTo(NetworkEnum.MAIN);
         dateFlag = parser.accepts("date").withRequiredArg().ofType(Date.class)
                 .withValuesConvertedBy(DateConverter.datePattern("yyyy/MM/dd"));
@@ -223,31 +247,30 @@ public class WalletTool {
         xpubkeysFlag = parser.accepts("xpubkeys").withRequiredArg();
         OptionSpec<String> outputFlag = parser.accepts("output").withRequiredArg();
         parser.accepts("value").withRequiredArg();
-        OptionSpec<String> feePerKbOption = parser.accepts("fee-per-kb").withRequiredArg();
+        OptionSpec<String> feePerVkbOption = parser.accepts("fee-per-vkb").withRequiredArg();
+        OptionSpec<String> feeSatPerVbyteOption = parser.accepts("fee-sat-per-vbyte").withRequiredArg();
         unixtimeFlag = parser.accepts("unixtime").withRequiredArg().ofType(Long.class);
         OptionSpec<String> conditionFlag = parser.accepts("condition").withRequiredArg();
         parser.accepts("locktime").withRequiredArg();
         parser.accepts("allow-unconfirmed");
         parser.accepts("offline");
         parser.accepts("ignore-mandatory-extensions");
-        lookaheadSize = parser.accepts("lookahead-size").withRequiredArg().ofType(Integer.class);
         OptionSpec<String> passwordFlag = parser.accepts("password").withRequiredArg();
         OptionSpec<String> paymentRequestLocation = parser.accepts("payment-request").withRequiredArg();
         parser.accepts("no-pki");
         parser.accepts("dump-privkeys");
-        OptionSpec<String> refundFlag = parser.accepts("refund-to").withRequiredArg();
-        OptionSpec<String> txHashFlag = parser.accepts("txhash").withRequiredArg();
+        parser.accepts("dump-lookahead");
         options = parser.parse(args);
 
         if (args.length == 0 || options.has("help") ||
                 options.nonOptionArguments().size() < 1 || options.nonOptionArguments().contains("help")) {
-            System.out.println(Resources.toString(WalletTool.class.getResource("wallet-tool-help.txt"), Charsets.UTF_8));
+            System.out.println(Resources.toString(WalletTool.class.getResource("wallet-tool-help.txt"), StandardCharsets.UTF_8));
             return;
         }
 
         ActionEnum action;
         try {
-            String actionStr = options.nonOptionArguments().get(0);
+            String actionStr = (String) options.nonOptionArguments().get(0);
             actionStr = actionStr.toUpperCase().replace("-", "_");
             action = ActionEnum.valueOf(actionStr);
         } catch (IllegalArgumentException e) {
@@ -359,16 +382,21 @@ public class WalletTool {
                 if (options.has(paymentRequestLocation) && options.has(outputFlag)) {
                     System.err.println("--payment-request and --output cannot be used together.");
                     return;
+                } else if (options.has(feePerVkbOption) && options.has(feeSatPerVbyteOption)) {
+                    System.err.println("--fee-per-kb and --fee-sat-per-byte cannot be used together.");
+                    return;
                 } else if (options.has(outputFlag)) {
-                    Coin feePerKb = null;
-                    if (options.has(feePerKbOption))
-                        feePerKb = parseCoin((String) options.valueOf(feePerKbOption));
+                    Coin feePerVkb = null;
+                    if (options.has(feePerVkbOption))
+                        feePerVkb = parseCoin((String) options.valueOf(feePerVkbOption));
+                    if (options.has(feeSatPerVbyteOption))
+                        feePerVkb = Coin.valueOf(Long.parseLong(options.valueOf(feeSatPerVbyteOption)) * 1000);
                     String lockTime = null;
                     if (options.has("locktime")) {
                         lockTime = (String) options.valueOf("locktime");
                     }
                     boolean allowUnconfirmed = options.has("allow-unconfirmed");
-                    send(outputFlag.values(options), feePerKb, lockTime, allowUnconfirmed);
+                    send(outputFlag.values(options), feePerVkb, lockTime, allowUnconfirmed);
                 } else if (options.has(paymentRequestLocation)) {
                     sendPaymentRequest(paymentRequestLocation.value(options), !options.has("no-pki"));
                 } else {
@@ -376,59 +404,10 @@ public class WalletTool {
                     return;
                 }
                 break;
-            case SEND_CLTVPAYMENTCHANNEL: {
-                if (!options.has(outputFlag)) {
-                    System.err.println("You must specify a --output=addr:value");
-                    return;
-                }
-                Coin feePerKb = null;
-                if (options.has(feePerKbOption))
-                    feePerKb = parseCoin((String) options.valueOf(feePerKbOption));
-                if (!options.has("locktime")) {
-                    System.err.println("You must specify a --locktime");
-                    return;
-                }
-                String lockTime = (String) options.valueOf("locktime");
-                boolean allowUnconfirmed = options.has("allow-unconfirmed");
-                if (!options.has(refundFlag)) {
-                    System.err.println("You must specify an address to refund money to after expiry: --refund-to=addr");
-                    return;
-                }
-                sendCLTVPaymentChannel(refundFlag.value(options), outputFlag.value(options), feePerKb, lockTime, allowUnconfirmed);
-                } break;
-            case SETTLE_CLTVPAYMENTCHANNEL: {
-                if (!options.has(outputFlag)) {
-                    System.err.println("You must specify a --output=addr:value");
-                    return;
-                }
-                Coin feePerKb = null;
-                if (options.has(feePerKbOption))
-                    feePerKb = parseCoin((String) options.valueOf(feePerKbOption));
-                boolean allowUnconfirmed = options.has("allow-unconfirmed");
-                if (!options.has(txHashFlag)) {
-                    System.err.println("You must specify the transaction to spend: --txhash=tx-hash");
-                    return;
-                }
-                settleCLTVPaymentChannel(txHashFlag.value(options), outputFlag.value(options), feePerKb, allowUnconfirmed);
-                } break;
-            case REFUND_CLTVPAYMENTCHANNEL: {
-                if (!options.has(outputFlag)) {
-                    System.err.println("You must specify a --output=addr:value");
-                    return;
-                }
-                Coin feePerKb = null;
-                if (options.has(feePerKbOption))
-                    feePerKb = parseCoin((String) options.valueOf(feePerKbOption));
-                boolean allowUnconfirmed = options.has("allow-unconfirmed");
-                if (!options.has(txHashFlag)) {
-                    System.err.println("You must specify the transaction to spend: --txhash=tx-hash");
-                    return;
-                }
-                refundCLTVPaymentChannel(txHashFlag.value(options), outputFlag.value(options), feePerKb, allowUnconfirmed);
-            } break;
             case ENCRYPT: encrypt(); break;
             case DECRYPT: decrypt(); break;
             case MARRY: marry(); break;
+            case UPGRADE: upgrade(); break;
             case ROTATE: rotate(); break;
             case SET_CREATION_TIME: setCreationTime(); break;
         }
@@ -504,9 +483,30 @@ public class WalletTool {
         wallet.addAndActivateHDChain(chain);
     }
 
+    private static void upgrade() {
+        DeterministicKeyChain activeKeyChain = wallet.getActiveKeyChain();
+        ScriptType currentOutputScriptType = activeKeyChain != null ? activeKeyChain.getOutputScriptType() : null;
+        ScriptType outputScriptType = options.valueOf(outputScriptTypeFlag);
+        if (!wallet.isDeterministicUpgradeRequired(outputScriptType)) {
+            System.err
+                    .println("No upgrade from " + (currentOutputScriptType != null ? currentOutputScriptType : "basic")
+                            + " to " + outputScriptType);
+            return;
+        }
+        KeyParameter aesKey = null;
+        if (wallet.isEncrypted()) {
+            aesKey = passwordToKey(true);
+            if (aesKey == null)
+                return;
+        }
+        wallet.upgradeToDeterministic(outputScriptType, aesKey);
+        System.out.println("Upgraded from " + (currentOutputScriptType != null ? currentOutputScriptType : "basic")
+                + " to " + outputScriptType);
+    }
+
     private static void rotate() throws BlockStoreException {
         setup();
-        peers.start();
+        peerGroup.start();
         // Set a key rotation time and possibly broadcast the resulting maintenance transactions.
         long rotationTimeSecs = Utils.currentTimeSeconds();
         if (options.has(dateFlag)) {
@@ -560,7 +560,7 @@ public class WalletTool {
             return;
         }
         try {
-            Address address = Address.fromBase58(params, addr);
+            Address address = LegacyAddress.fromBase58(params, addr);
             // If no creation time is specified, assume genesis (zero).
             wallet.addWatchedAddress(address, getCreationTimeSeconds());
         } catch (AddressFormatException e) {
@@ -568,7 +568,7 @@ public class WalletTool {
         }
     }
 
-    private static void send(List<String> outputs, Coin feePerKb, String lockTimeStr, boolean allowUnconfirmed) throws VerificationException {
+    private static void send(List<String> outputs, Coin feePerVkb, String lockTimeStr, boolean allowUnconfirmed) throws VerificationException {
         try {
             // Convert the input strings to outputs.
             Transaction t = new Transaction(params);
@@ -580,7 +580,7 @@ public class WalletTool {
                     } else {
                         t.addOutput(outputSpec.value, outputSpec.key);
                     }
-                } catch (WrongNetworkException e) {
+                } catch (AddressFormatException.WrongNetwork e) {
                     System.err.println("Malformed output specification, address is for a different network: " + spec);
                     return;
                 } catch (AddressFormatException e) {
@@ -599,10 +599,10 @@ public class WalletTool {
                 log.info("Emptying out wallet, recipient may get less than what you expect");
                 req.emptyWallet = true;
             }
-            if (feePerKb != null)
-                req.feePerKb = feePerKb;
+            if (feePerVkb != null)
+                req.setFeePerVkb(feePerVkb);
             if (allowUnconfirmed) {
-                wallet.allowSpendingUnconfirmedTransactions();
+                req.allowUnconfirmed();
             }
             if (password != null) {
                 req.aesKey = passwordToKey(true);
@@ -626,20 +626,20 @@ public class WalletTool {
                 throw new RuntimeException(e);
             }
             t = req.tx;   // Not strictly required today.
-            System.out.println(t.getHashAsString());
+            System.out.println(t.getTxId());
             if (options.has("offline")) {
                 wallet.commitTx(t);
                 return;
             }
 
             setup();
-            peers.start();
+            peerGroup.start();
             // Wait for peers to connect, the tx to be sent to one of them and for it to be propagated across the
             // network. Once propagation is complete and we heard the transaction back from all our peers, it will
             // be committed to the wallet.
-            peers.broadcastTransaction(t).future().get();
+            peerGroup.broadcastTransaction(t).future().get();
             // Hack for regtest/single peer mode, as we're about to shut down and won't get an ACK from the remote end.
-            List<Peer> peerList = peers.getConnectedPeers();
+            List<Peer> peerList = peerGroup.getConnectedPeers();
             if (peerList.size() == 1)
                 peerList.get(0).ping().get();
         } catch (BlockStoreException e) {
@@ -677,305 +677,13 @@ public class WalletTool {
                 addr = null;
             } else {
                 // Treat as an address.
-                addr = Address.fromBase58(params, destination);
+                addr = Address.fromString(params, destination);
                 key = null;
             }
         }
 
         public boolean isAddress() {
             return addr != null;
-        }
-    }
-
-    private static void sendCLTVPaymentChannel(String refund, String output, Coin feePerKb, String lockTimeStr, boolean allowUnconfirmed) throws VerificationException {
-        try {
-            // Convert the input strings to outputs.
-            ECKey outputKey, refundKey;
-            Coin value;
-            try {
-                OutputSpec outputSpec = new OutputSpec(output);
-                if (outputSpec.isAddress()) {
-                    System.err.println("Output specification must be a public key");
-                    return;
-                }
-                outputKey = outputSpec.key;
-                value = outputSpec.value;
-                byte[] refundPubKey = new BigInteger(refund, 16).toByteArray();
-                refundKey = ECKey.fromPublicOnly(refundPubKey);
-            } catch (WrongNetworkException e) {
-                System.err.println("Malformed output specification, address is for a different network.");
-                return;
-            } catch (AddressFormatException e) {
-                System.err.println("Malformed output specification, could not parse as address.");
-                return;
-            } catch (NumberFormatException e) {
-                System.err.println("Malformed output specification, could not parse as value.");
-                return;
-            } catch (IllegalArgumentException e) {
-                System.err.println(e.getMessage());
-                return;
-            }
-
-            long lockTime;
-            try {
-                lockTime = parseLockTimeStr(lockTimeStr);
-            } catch (ParseException e) {
-                System.err.println("Could not understand --locktime of " + lockTimeStr);
-                return;
-            } catch (ScriptException e) {
-                throw new RuntimeException(e);
-            }
-
-            SendRequest req = SendRequest.toCLTVPaymentChannel(params, BigInteger.valueOf(lockTime), refundKey, outputKey, value);
-            if (req.tx.getOutputs().size() == 1 && req.tx.getOutput(0).getValue().equals(wallet.getBalance())) {
-                log.info("Emptying out wallet, recipient may get less than what you expect");
-                req.emptyWallet = true;
-            }
-            if (feePerKb != null)
-                req.feePerKb = feePerKb;
-            if (allowUnconfirmed) {
-                wallet.allowSpendingUnconfirmedTransactions();
-            }
-            if (password != null) {
-                req.aesKey = passwordToKey(true);
-                if (req.aesKey == null)
-                    return;  // Error message already printed.
-            }
-            wallet.completeTx(req);
-
-            System.out.println(req.tx.getHashAsString());
-            if (options.has("offline")) {
-                wallet.commitTx(req.tx);
-                return;
-            }
-
-            setup();
-            peers.start();
-            // Wait for peers to connect, the tx to be sent to one of them and for it to be propagated across the
-            // network. Once propagation is complete and we heard the transaction back from all our peers, it will
-            // be committed to the wallet.
-            peers.broadcastTransaction(req.tx).future().get();
-            // Hack for regtest/single peer mode, as we're about to shut down and won't get an ACK from the remote end.
-            List<Peer> peerList = peers.getConnectedPeers();
-            if (peerList.size() == 1)
-                peerList.get(0).ping().get();
-        } catch (BlockStoreException e) {
-            throw new RuntimeException(e);
-        } catch (KeyCrypterException e) {
-            throw new RuntimeException(e);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
-        } catch (InsufficientMoneyException e) {
-            System.err.println("Insufficient funds: have " + wallet.getBalance().toFriendlyString());
-        }
-    }
-
-    /**
-     * Settles a CLTV payment channel transaction given that we own both private keys (ie. for testing).
-     */
-    private static void settleCLTVPaymentChannel(String txHash, String output, Coin feePerKb, boolean allowUnconfirmed) {
-        try {
-            OutputSpec outputSpec;
-            Coin value;
-            try {
-                outputSpec = new OutputSpec(output);
-                value = outputSpec.value;
-            } catch (WrongNetworkException e) {
-                System.err.println("Malformed output specification, address is for a different network.");
-                return;
-            } catch (AddressFormatException e) {
-                System.err.println("Malformed output specification, could not parse as address.");
-                return;
-            } catch (NumberFormatException e) {
-                System.err.println("Malformed output specification, could not parse as value.");
-                return;
-            } catch (IllegalArgumentException e) {
-                System.err.println(e.getMessage());
-                return;
-            }
-
-            SendRequest req = outputSpec.isAddress() ?
-                    SendRequest.to(outputSpec.addr, value) :
-                    SendRequest.to(params, outputSpec.key, value);
-            if (feePerKb != null)
-                req.feePerKb = feePerKb;
-
-            Transaction lockTimeVerify = wallet.getTransaction(Sha256Hash.wrap(txHash));
-            if (lockTimeVerify == null) {
-                System.err.println("Couldn't find transaction with given hash");
-                return;
-            }
-            TransactionOutput lockTimeVerifyOutput = null;
-            for (TransactionOutput out : lockTimeVerify.getOutputs()) {
-                if (out.getScriptPubKey().isSentToCLTVPaymentChannel()) {
-                    lockTimeVerifyOutput = out;
-                }
-            }
-            if (lockTimeVerifyOutput == null) {
-                System.err.println("TX to spend wasn't sent to LockTimeVerify");
-                return;
-            }
-
-            if (!value.equals(lockTimeVerifyOutput.getValue())) {
-                System.err.println("You must spend all the money in the input transaction");
-            }
-
-            if (allowUnconfirmed) {
-                wallet.allowSpendingUnconfirmedTransactions();
-            }
-            if (password != null) {
-                req.aesKey = passwordToKey(true);
-                if (req.aesKey == null)
-                    return;  // Error message already printed.
-            }
-
-            ECKey key1 = wallet.findKeyFromPubKey(
-                    lockTimeVerifyOutput.getScriptPubKey().getCLTVPaymentChannelSenderPubKey());
-            ECKey key2 = wallet.findKeyFromPubKey(
-                    lockTimeVerifyOutput.getScriptPubKey().getCLTVPaymentChannelRecipientPubKey());
-            if (key1 == null || key2 == null) {
-                System.err.println("Don't own private keys for both pubkeys");
-                return;
-            }
-
-            TransactionInput input = new TransactionInput(
-                    params, req.tx, new byte[] {}, lockTimeVerifyOutput.getOutPointFor());
-            req.tx.addInput(input);
-            TransactionSignature sig1 =
-                    req.tx.calculateSignature(0, key1, lockTimeVerifyOutput.getScriptPubKey(), Transaction.SigHash.SINGLE, false);
-            TransactionSignature sig2 =
-                    req.tx.calculateSignature(0, key2, lockTimeVerifyOutput.getScriptPubKey(), Transaction.SigHash.SINGLE, false);
-            input.setScriptSig(ScriptBuilder.createCLTVPaymentChannelInput(sig1, sig2));
-
-            System.out.println(req.tx.getHashAsString());
-            if (options.has("offline")) {
-                wallet.commitTx(req.tx);
-                return;
-            }
-
-            setup();
-            peers.start();
-            // Wait for peers to connect, the tx to be sent to one of them and for it to be propagated across the
-            // network. Once propagation is complete and we heard the transaction back from all our peers, it will
-            // be committed to the wallet.
-            peers.broadcastTransaction(req.tx).future().get();
-            // Hack for regtest/single peer mode, as we're about to shut down and won't get an ACK from the remote end.
-            List<Peer> peerList = peers.getConnectedPeers();
-            if (peerList.size() == 1)
-                peerList.get(0).ping().get();
-        } catch (BlockStoreException e) {
-            throw new RuntimeException(e);
-        } catch (KeyCrypterException e) {
-            throw new RuntimeException(e);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * Refunds a CLTV payment channel transaction after the lock time has expired.
-     */
-    private static void refundCLTVPaymentChannel(String txHash, String output, Coin feePerKb, boolean allowUnconfirmed) {
-        try {
-            OutputSpec outputSpec;
-            Coin value;
-            try {
-                outputSpec = new OutputSpec(output);
-                value = outputSpec.value;
-            } catch (WrongNetworkException e) {
-                System.err.println("Malformed output specification, address is for a different network.");
-                return;
-            } catch (AddressFormatException e) {
-                System.err.println("Malformed output specification, could not parse as address.");
-                return;
-            } catch (NumberFormatException e) {
-                System.err.println("Malformed output specification, could not parse as value.");
-                return;
-            } catch (IllegalArgumentException e) {
-                System.err.println(e.getMessage());
-                return;
-            }
-
-            SendRequest req = outputSpec.isAddress() ?
-                    SendRequest.to(outputSpec.addr, value) :
-                    SendRequest.to(params, outputSpec.key, value);
-            if (feePerKb != null)
-                req.feePerKb = feePerKb;
-
-            Transaction lockTimeVerify = wallet.getTransaction(Sha256Hash.wrap(txHash));
-            if (lockTimeVerify == null) {
-                System.err.println("Couldn't find transaction with given hash");
-                return;
-            }
-            TransactionOutput lockTimeVerifyOutput = null;
-            for (TransactionOutput out : lockTimeVerify.getOutputs()) {
-                if (out.getScriptPubKey().isSentToCLTVPaymentChannel()) {
-                    lockTimeVerifyOutput = out;
-                }
-            }
-            if (lockTimeVerifyOutput == null) {
-                System.err.println("TX to spend wasn't sent to LockTimeVerify");
-                return;
-            }
-
-            req.tx.setLockTime(lockTimeVerifyOutput.getScriptPubKey().getCLTVPaymentChannelExpiry().longValue());
-
-            if (!value.equals(lockTimeVerifyOutput.getValue())) {
-                System.err.println("You must spend all the money in the input transaction");
-            }
-
-            if (allowUnconfirmed) {
-                wallet.allowSpendingUnconfirmedTransactions();
-            }
-            if (password != null) {
-                req.aesKey = passwordToKey(true);
-                if (req.aesKey == null)
-                    return;  // Error message already printed.
-            }
-
-            ECKey key = wallet.findKeyFromPubKey(
-                    lockTimeVerifyOutput.getScriptPubKey().getCLTVPaymentChannelSenderPubKey());
-            if (key == null) {
-                System.err.println("Don't own private key for pubkey");
-                return;
-            }
-
-            TransactionInput input = new TransactionInput(
-                    params, req.tx, new byte[] {}, lockTimeVerifyOutput.getOutPointFor());
-            input.setSequenceNumber(0);
-            req.tx.addInput(input);
-            TransactionSignature sig =
-                    req.tx.calculateSignature(0, key, lockTimeVerifyOutput.getScriptPubKey(), Transaction.SigHash.SINGLE, false);
-            input.setScriptSig(ScriptBuilder.createCLTVPaymentChannelRefund(sig));
-
-            System.out.println(req.tx.getHashAsString());
-            if (options.has("offline")) {
-                wallet.commitTx(req.tx);
-                return;
-            }
-
-            setup();
-            peers.start();
-            // Wait for peers to connect, the tx to be sent to one of them and for it to be propagated across the
-            // network. Once propagation is complete and we heard the transaction back from all our peers, it will
-            // be committed to the wallet.
-            peers.broadcastTransaction(req.tx).future().get();
-            // Hack for regtest/single peer mode, as we're about to shut down and won't get an ACK from the remote end.
-            List<Peer> peerList = peers.getConnectedPeers();
-            if (peerList.size() == 1)
-                peerList.get(0).ping().get();
-        } catch (BlockStoreException e) {
-            throw new RuntimeException(e);
-        } catch (KeyCrypterException e) {
-            throw new RuntimeException(e);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -1073,8 +781,8 @@ public class WalletTool {
             ListenableFuture<PaymentProtocol.Ack> future = session.sendPayment(ImmutableList.of(req.tx), null, null);
             if (future == null) {
                 // No payment_url for submission so, broadcast and wait.
-                peers.start();
-                peers.broadcastTransaction(req.tx).future().get();
+                peerGroup.start();
+                peerGroup.broadcastTransaction(req.tx).future().get();
             } else {
                 PaymentProtocol.Ack ack = future.get();
                 wallet.commitTx(req.tx);
@@ -1113,7 +821,7 @@ public class WalletTool {
                     @Override
                     public void onCoinsReceived(Wallet wallet, Transaction tx, Coin prevBalance, Coin newBalance) {
                         // Runs in a peer thread.
-                        System.out.println(tx.getHashAsString());
+                        System.out.println(tx.getTxId());
                         latch.countDown();  // Wake up main thread.
                     }
                 });
@@ -1121,14 +829,14 @@ public class WalletTool {
                     @Override
                     public void onCoinsSent(Wallet wallet, Transaction tx, Coin prevBalance, Coin newBalance) {
                         // Runs in a peer thread.
-                        System.out.println(tx.getHashAsString());
+                        System.out.println(tx.getTxId());
                         latch.countDown();  // Wake up main thread.
                     }
                 });
                 break;
 
             case BLOCK:
-                peers.addBlocksDownloadedEventListener(new BlocksDownloadedEventListener() {
+                peerGroup.addBlocksDownloadedEventListener(new BlocksDownloadedEventListener() {
                     @Override
                     public void onBlocksDownloaded(Peer peer, Block block, @Nullable FilteredBlock filteredBlock, int blocksLeft) {
                         // Check if we already ran. This can happen if a block being received triggers download of more
@@ -1154,8 +862,8 @@ public class WalletTool {
                 break;
 
         }
-        if (!peers.isRunning())
-            peers.startAsync();
+        if (!peerGroup.isRunning())
+            peerGroup.startAsync();
         try {
             latch.await();
         } catch (InterruptedException e) {
@@ -1181,7 +889,6 @@ public class WalletTool {
         }
         if (mode == ValidationMode.SPV) {
             store = new SPVBlockStore(params, chainFileName);
-            chain = new BlockChain(params, wallet, store);
             if (reset) {
                 try {
                     CheckpointManager.checkpoint(params, CheckpointManager.openStream(params), store,
@@ -1193,31 +900,33 @@ public class WalletTool {
                     System.out.println("Could not load checkpoints: " + x.getMessage());
                 }
             }
+            chain = new BlockChain(params, wallet, store);
         } else if (mode == ValidationMode.FULL) {
-            FullPrunedBlockStore s = new H2FullPrunedBlockStore(params, chainFileName.getAbsolutePath(), 5000);
-            store = s;
-            chain = new FullPrunedBlockChain(params, wallet, s);
+            store = new H2FullPrunedBlockStore(params, chainFileName.getAbsolutePath(), 5000);
+            chain = new FullPrunedBlockChain(params, wallet, (FullPrunedBlockStore) store);
         }
         // This will ensure the wallet is saved when it changes.
         wallet.autosaveToFile(walletFile, 5, TimeUnit.SECONDS, null);
-        if (peers == null) {
-            peers = new PeerGroup(params, chain);
+        if (peerGroup == null) {
+            peerGroup = new PeerGroup(params, chain);
         }
-        peers.setUserAgent("WalletTool", "1.0");
+        peerGroup.setUserAgent("WalletTool", "1.0");
         if (params == RegTestParams.get())
-            peers.setMinBroadcastConnections(1);
-        peers.addWallet(wallet);
+            peerGroup.setMinBroadcastConnections(1);
+        peerGroup.addWallet(wallet);
         if (options.has("peers")) {
             String peersFlag = (String) options.valueOf("peers");
             String[] peerAddrs = peersFlag.split(",");
             for (String peer : peerAddrs) {
                 try {
-                    peers.addAddress(new PeerAddress(params, InetAddress.getByName(peer)));
+                    peerGroup.addAddress(new PeerAddress(params, InetAddress.getByName(peer)));
                 } catch (UnknownHostException e) {
                     System.err.println("Could not understand peer domain name/IP address: " + peer + ": " + e.getMessage());
                     System.exit(1);
                 }
             }
+        } else {
+            peerGroup.setRequiredServices(0);
         }
     }
 
@@ -1226,8 +935,8 @@ public class WalletTool {
             setup();
             int startTransactions = wallet.getTransactions(true).size();
             DownloadProgressTracker listener = new DownloadProgressTracker();
-            peers.start();
-            peers.startBlockChainDownload(listener);
+            peerGroup.start();
+            peerGroup.startBlockChainDownload(listener);
             try {
                 listener.await();
             } catch (InterruptedException e) {
@@ -1246,9 +955,9 @@ public class WalletTool {
 
     private static void shutdown() {
         try {
-            if (peers == null) return;  // setup() never called so nothing to do.
-            if (peers.isRunning())
-                peers.stop();
+            if (peerGroup == null) return;  // setup() never called so nothing to do.
+            if (peerGroup.isRunning())
+                peerGroup.stop();
             saveWallet(walletFile);
             store.close();
             wallet = null;
@@ -1263,13 +972,15 @@ public class WalletTool {
             return;
         }
         long creationTimeSecs = getCreationTimeSeconds();
+        ScriptType outputScriptType = options.valueOf(outputScriptTypeFlag);
         if (creationTimeSecs == 0)
             creationTimeSecs = MnemonicCode.BIP39_STANDARDISATION_TIME_SECS;
         if (options.has(seedFlag)) {
             String seedStr = options.valueOf(seedFlag);
             DeterministicSeed seed;
             // Parse as mnemonic code.
-            final List<String> split = ImmutableList.copyOf(Splitter.on(" ").omitEmptyStrings().split(seedStr));
+            final List<String> split = ImmutableList
+                    .copyOf(Splitter.on(CharMatcher.anyOf(" :;,")).omitEmptyStrings().split(seedStr));
             String passphrase = ""; // TODO allow user to specify a passphrase
             seed = new DeterministicSeed(split, null, passphrase, creationTimeSecs);
             try {
@@ -1287,11 +998,11 @@ public class WalletTool {
                 // not reached - all subclasses handled above
                 throw new RuntimeException(e);
             }
-            wallet = Wallet.fromSeed(params, seed);
+            wallet = Wallet.fromSeed(params, seed, outputScriptType);
         } else if (options.has(watchFlag)) {
             wallet = Wallet.fromWatchingKeyB58(params, options.valueOf(watchFlag), creationTimeSecs);
         } else {
-            wallet = new Wallet(params);
+            wallet = Wallet.createDeterministic(params, outputScriptType);
         }
         if (password != null)
             wallet.encrypt(password);
@@ -1310,30 +1021,57 @@ public class WalletTool {
     }
 
     private static void addKey() {
-        // If we're being given precise details, we have to import the key.
-        if (options.has("privkey") || options.has("pubkey")) {
-            importKey();
-        } else {
-            if (options.has(lookaheadSize)) {
-                Integer size = options.valueOf(lookaheadSize);
-                log.info("Setting keychain lookahead size to {}", size);
-                wallet.setKeyChainGroupLookaheadSize(size);
-            }
-            ECKey key;
+        ECKey key;
+        long creationTimeSeconds = getCreationTimeSeconds();
+        if (options.has("privkey")) {
+            String data = (String) options.valueOf("privkey");
             try {
-                key = wallet.freshReceiveKey();
-            } catch (DeterministicUpgradeRequiredException e) {
-                try {
-                    KeyParameter aesKey = passwordToKey(false);
-                    wallet.upgradeToDeterministic(aesKey);
-                } catch (DeterministicUpgradeRequiresPassword e2) {
-                    System.err.println("This wallet must be upgraded to be deterministic, but it's encrypted: please supply the password and try again.");
+                DumpedPrivateKey dpk = DumpedPrivateKey.fromBase58(params, data); // WIF
+                key = dpk.getKey();
+            } catch (AddressFormatException e) {
+                byte[] decode = parseAsHexOrBase58(data);
+                if (decode == null) {
+                    System.err.println("Could not understand --privkey as either WIF, hex or base58: " + data);
                     return;
                 }
-                key = wallet.freshReceiveKey();
+                key = ECKey.fromPrivate(new BigInteger(1, decode));
             }
-            System.out.println(key.toAddress(params) + " " + key);
+            if (options.has("pubkey")) {
+                // Give the user a hint.
+                System.out.println("You don't have to specify --pubkey when a private key is supplied.");
+            }
+            key.setCreationTimeSeconds(creationTimeSeconds);
+        } else if (options.has("pubkey")) {
+            byte[] pubkey = parseAsHexOrBase58((String) options.valueOf("pubkey"));
+            key = ECKey.fromPublicOnly(pubkey);
+            key.setCreationTimeSeconds(creationTimeSeconds);
+        } else {
+            System.err.println("Either --privkey or --pubkey must be specified.");
+            return;
         }
+        if (wallet.hasKey(key)) {
+            System.err.println("That key already exists in this wallet.");
+            return;
+        }
+        try {
+            if (wallet.isEncrypted()) {
+                KeyParameter aesKey = passwordToKey(true);
+                if (aesKey == null)
+                    return;   // Error message already printed.
+                key = key.encrypt(checkNotNull(wallet.getKeyCrypter()), aesKey);
+            }
+        } catch (KeyCrypterException kce) {
+            System.err.println("There was an encryption related error when adding the key. The error was '"
+                    + kce.getMessage() + "'.");
+            return;
+        }
+        if (!key.isCompressed())
+            System.out.println("WARNING: Importing an uncompressed key");
+        wallet.importKey(key);
+        System.out.print("Addresses: " + LegacyAddress.fromKey(params, key));
+        if (key.isCompressed())
+            System.out.print("," + SegwitAddress.fromKey(params, key));
+        System.out.println();
     }
 
     @Nullable
@@ -1351,55 +1089,20 @@ public class WalletTool {
         return checkNotNull(wallet.getKeyCrypter()).deriveKey(password);
     }
 
-    private static void importKey() {
-        ECKey key;
-        long creationTimeSeconds = getCreationTimeSeconds();
-        if (options.has("privkey")) {
-            String data = (String) options.valueOf("privkey");
-            if (data.startsWith("5J") || data.startsWith("5H") || data.startsWith("5K")) {
-                DumpedPrivateKey dpk;
-                try {
-                    dpk = DumpedPrivateKey.fromBase58(params, data);
-                } catch (AddressFormatException e) {
-                    System.err.println("Could not parse dumped private key " + data);
-                    return;
-                }
-                key = dpk.getKey();
-            } else {
-                byte[] decode = Utils.parseAsHexOrBase58(data);
-                if (decode == null) {
-                    System.err.println("Could not understand --privkey as either hex or base58: " + data);
-                    return;
-                }
-                key = ECKey.fromPrivate(new BigInteger(1, decode));
-            }
-            if (options.has("pubkey")) {
-                // Give the user a hint.
-                System.out.println("You don't have to specify --pubkey when a private key is supplied.");
-            }
-            key.setCreationTimeSeconds(creationTimeSeconds);
-        } else if (options.has("pubkey")) {
-            byte[] pubkey = Utils.parseAsHexOrBase58((String) options.valueOf("pubkey"));
-            key = ECKey.fromPublicOnly(pubkey);
-            key.setCreationTimeSeconds(creationTimeSeconds);
-        } else {
-            throw new IllegalStateException();
-        }
-        if (wallet.findKeyFromPubKey(key.getPubKey()) != null) {
-            System.err.println("That key already exists in this wallet.");
-            return;
-        }
+    /**
+     * Attempts to parse the given string as arbitrary-length hex or base58 and then return the results, or null if
+     * neither parse was successful.
+     */
+    private static byte[] parseAsHexOrBase58(String data) {
         try {
-            if (wallet.isEncrypted()) {
-                KeyParameter aesKey = passwordToKey(true);
-                if (aesKey == null)
-                    return;   // Error message already printed.
-                key = key.encrypt(checkNotNull(wallet.getKeyCrypter()), aesKey);
+            return Utils.HEX.decode(data);
+        } catch (Exception e) {
+            // Didn't decode as hex, try base58.
+            try {
+                return Base58.decodeChecked(data);
+            } catch (AddressFormatException e1) {
+                return null;
             }
-            wallet.importKey(key);
-            System.out.println(key.toAddress(params) + " " + key);
-        } catch (KeyCrypterException kce) {
-            System.err.println("There was an encryption related error when adding the key. The error was '" + kce.getMessage() + "'.");
         }
     }
 
@@ -1413,19 +1116,19 @@ public class WalletTool {
     }
 
     private static void deleteKey() {
-        String pubkey = (String) options.valueOf("pubkey");
+        String pubKey = (String) options.valueOf("pubkey");
         String addr = (String) options.valueOf("addr");
-        if (pubkey == null && addr == null) {
+        if (pubKey == null && addr == null) {
             System.err.println("One of --pubkey or --addr must be specified.");
             return;
         }
         ECKey key = null;
-        if (pubkey != null) {
-            key = wallet.findKeyFromPubKey(Hex.decode(pubkey));
+        if (pubKey != null) {
+            key = wallet.findKeyFromPubKey(HEX.decode(pubKey));
         } else {
             try {
-                Address address = Address.fromBase58(wallet.getParams(), addr);
-                key = wallet.findKeyFromPubHash(address.getHash160());
+                Address address = Address.fromString(wallet.getParams(), addr);
+                key = wallet.findKeyFromAddress(address);
             } catch (AddressFormatException e) {
                 System.err.println(addr + " does not parse as a Bitcoin address of the right network parameters.");
                 return;
@@ -1435,12 +1138,16 @@ public class WalletTool {
             System.err.println("Wallet does not seem to contain that key.");
             return;
         }
-        wallet.removeKey(key);
+        boolean removed = wallet.removeKey(key);
+        if (removed)
+            System.out.println("Key " + key + " was removed");
+        else
+            System.err.println("Key " + key + " could not be removed");
     }
 
     private static void currentReceiveAddr() {
-        ECKey key = wallet.currentReceiveKey();
-        System.out.println(key.toAddress(params) + " " + key);
+        Address address = wallet.currentReceiveAddress();
+        System.out.println(address);
     }
 
     private static void dumpWallet() throws BlockStoreException {
@@ -1450,33 +1157,35 @@ public class WalletTool {
             setup();
 
         final boolean dumpPrivkeys = options.has("dump-privkeys");
+        final boolean dumpLookahead = options.has("dump-lookahead");
         if (dumpPrivkeys && wallet.isEncrypted()) {
             if (password != null) {
                 final KeyParameter aesKey = passwordToKey(true);
                 if (aesKey == null)
                     return; // Error message already printed.
-                System.out.println(wallet.toString(true, aesKey, true, true, chain));
+                System.out.println(wallet.toString(dumpLookahead, true, aesKey, true, true, chain));
             } else {
                 System.err.println("Can't dump privkeys, wallet is encrypted.");
                 return;
             }
         } else {
-            System.out.println(wallet.toString(dumpPrivkeys, null, true, true, chain));
+            System.out.println(wallet.toString(dumpLookahead, dumpPrivkeys, null, true, true, chain));
         }
     }
 
     private static void setCreationTime() {
-        DeterministicSeed seed = wallet.getActiveKeyChain().getSeed();
-        if (seed == null) {
-            System.err.println("Active chain does not have a seed.");
-            return;
-        }
         long creationTime = getCreationTimeSeconds();
+        for (DeterministicKeyChain chain : wallet.getActiveKeyChains()) {
+            DeterministicSeed seed = chain.getSeed();
+            if (seed == null)
+                System.out.println("Active chain does not have a seed: " + chain);
+            else
+                seed.setCreationTimeSeconds(creationTime);
+        }
         if (creationTime > 0)
             System.out.println("Setting creation time to: " + Utils.dateTimeFormat(creationTime * 1000));
         else
             System.out.println("Clearing creation time.");
-        seed.setCreationTimeSeconds(creationTime);
     }
 
     static synchronized void onChange(final CountDownLatch latch) {

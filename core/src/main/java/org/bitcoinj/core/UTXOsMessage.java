@@ -16,19 +16,21 @@
 
 package org.bitcoinj.core;
 
-import com.google.common.base.Objects;
+import org.bitcoinj.net.discovery.HttpDiscovery;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * <p>Message representing a list of unspent transaction outputs ("utxos"), returned in response to sending a
  * {@link GetUTXOsMessage} ("getutxos"). Note that both this message and the query that generates it are not
  * supported by Bitcoin Core. An implementation is available in <a href="https://github.com/bitcoinxt/bitcoinxt">Bitcoin XT</a>,
  * a patch set on top of Core. Thus if you want to use it, you must find some XT peers to connect to. This can be done
- * using a {@link org.bitcoinj.net.discovery.HttpDiscovery} class combined with an HTTP/Cartographer seed.</p>
+ * using a {@link HttpDiscovery} class combined with an HTTP/Cartographer seed.</p>
  *
  * <p>The getutxos/utxos protocol is defined in <a href="https://github.com/bitcoin/bips/blob/master/bip-0065.mediawiki">BIP 65</a>.
  * In that document you can find a discussion of the security of this protocol (briefly, there is none). Because the
@@ -101,7 +103,7 @@ public class UTXOsMessage extends Message {
         //   vector<CCoin> outs;
         //
         // A CCoin is  { int nVersion, int nHeight, CTxOut output }
-        // The bitmap indicates which of the requested TXOs were found in the UTXO set.
+        // hitsBitmap indicates which of the queried outputs were found in the UTXO set.
         height = readUint32();
         chainHead = readHash();
         int numBytes = (int) readVarInt();
@@ -164,6 +166,6 @@ public class UTXOsMessage extends Message {
 
     @Override
     public int hashCode() {
-        return Objects.hashCode(height, chainHead, Arrays.hashCode(heights), Arrays.hashCode(hits), outputs);
+        return Objects.hash(height, chainHead, Arrays.hashCode(heights), Arrays.hashCode(hits), outputs);
     }
 }

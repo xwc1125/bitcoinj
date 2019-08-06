@@ -16,14 +16,13 @@
 
 package org.bitcoinj.utils;
 
-import com.google.common.base.*;
 import org.bitcoinj.core.*;
 import org.slf4j.*;
 
 import java.util.concurrent.*;
 
 /**
- * A {@link java.util.concurrent.ThreadFactory} that propagates a {@link org.bitcoinj.core.Context} from the creating
+ * A {@link ThreadFactory} that propagates a {@link Context} from the creating
  * thread into the new thread. This factory creates daemon threads.
  */
 public class ContextPropagatingThreadFactory implements ThreadFactory {
@@ -51,7 +50,7 @@ public class ContextPropagatingThreadFactory implements ThreadFactory {
                     r.run();
                 } catch (Exception e) {
                     log.error("Exception in thread", e);
-                    Throwables.propagate(e);
+                    throw e;
                 }
             }
         }, name);
