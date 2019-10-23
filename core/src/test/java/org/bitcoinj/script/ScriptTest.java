@@ -91,7 +91,7 @@ public class ScriptTest {
         Script script = ScriptBuilder.createMultiSigOutputScript(3, keys);
         assertTrue(ScriptPattern.isSentToMultisig(script));
         List<ECKey> pubkeys = new ArrayList<>(3);
-        for (ECKey key : keys) pubkeys.add(ECKey.fromPublicOnly(key.getPubKeyPoint()));
+        for (ECKey key : keys) pubkeys.add(ECKey.fromPublicOnly(key));
         assertEquals(script.getPubKeys(), pubkeys);
         assertFalse(ScriptPattern.isSentToMultisig(ScriptBuilder.createP2PKOutputScript(new ECKey())));
         try {
@@ -431,7 +431,7 @@ public class ScriptTest {
 
     @Test
     public void getToAddress() throws Exception {
-        // pay to pubkey
+        // P2PK
         ECKey toKey = new ECKey();
         Address toAddress = LegacyAddress.fromKey(TESTNET, toKey);
         assertEquals(toAddress, ScriptBuilder.createP2PKOutputScript(toKey).getToAddress(TESTNET, true));
